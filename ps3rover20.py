@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 '''
 ps3rover20.py Drive the Brookstone Rover 2.0 via the P3 Controller, displaying
@@ -17,124 +17,152 @@ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 GNU General Public License for more details.
 '''
 
-# You may want to adjust these buttons for your own controller
-BUTTON_LIGHTS      = 3  # Square button toggles lights
-BUTTON_STEALTH     = 1  # Circle button toggles stealth mode
-BUTTON_CAMERA_UP   = 0  # Triangle button raises camera
-BUTTON_CAMERA_DOWN = 2  # X button lowers camera
-
-# Avoid button bounce by enforcing lag between button events
-MIN_BUTTON_LAG_SEC = 0.5
-
-# Avoid close-to-zero values on axis
-MIN_AXIS_ABSVAL    = 0.01
-
-
 from rover import Rover20
-
-
 import time
 import pygame
 import sys
 import signal
-                                   
-# Supports CTRL-C to override threads
-def _signal_handler(signal, frame):
-    frame.f_locals['rover'].close()
+import numpy as np
+from typing import Optional
+
+# Controller configuration - adjust these for your specific controller
+BUTTON_LIGHTS = 3       # Square button toggles lights
+BUTTON_STEALTH = 1      # Circle button toggles stealth mode
+BUTTON_CAMERA_UP = 0    # Triangle button raises camera
+BUTTON_CAMERA_DOWN = 2  # X button lowers camera
+
+# Timing and sensitivity configuration
+MIN_BUTTON_LAG_SEC = 0.5  # Debounce delay between button presses
+MIN_AXIS_ABSVAL = 0.01    # Dead zone for analog sticks
+
+
+# Enhanced signal handler with cleanup
+def _signal_handler(sig, frame):
+    """Handle CTRL-C gracefully with proper cleanup."""
+    print("\nShutting down rover...")
+    rover = frame.f_globals.get('rover')
+    if rover:
+        rover.cleanup()
+        rover.close()
     sys.exit(0)
 
 # Try to start OpenCV for video
 try:
-    import cv
-except:
-    cv = None
+    import cv2
+except ImportError:
+    cv2 = None
+    print("Warning: OpenCV not available. Video display will be disabled.")
 
 # Rover subclass for PS3 + OpenCV
 class PS3Rover(Rover20):
-
+    """Enhanced PS3 controller interface for Rover 2.0 with modern OpenCV support."""
+    
     def __init__(self):
-
         # Set up basics
-        Rover20.__init__(self)
+        super().__init__()
         self.wname = 'Rover 2.0: Hit ESC to quit'
         self.quit = False
-
+        
         # Set up controller using PyGame
         pygame.display.init()
         pygame.joystick.init()
+        
+        if pygame.joystick.get_count() == 0:
+            raise RuntimeError("No joystick/controller detected. Please connect a PS3 controller.")
+            
         self.controller = pygame.joystick.Joystick(0)
         self.controller.init()
-
-         # Defaults on startup: lights off, ordinary camera
-        self.lightsAreOn = False
-        self.stealthIsOn = False
-
+        
+        # Defaults on startup: lights off, ordinary camera
+        self.lights_are_on = False
+        self.stealth_is_on = False
+        
         # Tracks button-press times for debouncing
-        self.lastButtonTime = 0
-
-        # Try to create OpenCV named window
+        self.last_button_time = 0
+        
+        # Create OpenCV window if available
+        self.video_enabled = False
+        if cv2 is not None:
+            try:
+                cv2.namedWindow(self.wname, cv2.WINDOW_AUTOSIZE)
+                self.video_enabled = True
+            except cv2.error as e:
+                print(f"Warning: Could not create OpenCV window: {e}")
+        
+        # Use context manager for PCM file
+        self.pcm_file: Optional[object] = None
         try:
-            if cv:
-                cv.NamedWindow(self.wname, cv.CV_WINDOW_AUTOSIZE )
-            else:
-                pass
-        except:
-            pass
+            self.pcm_file = open('rover20.pcm', 'w')
+        except IOError as e:
+            print(f"Warning: Could not create PCM file: {e}")
 
-        self.pcmfile = open('rover20.pcm', 'w')
-
-    # Automagically called by Rover class
     def processAudio(self, pcmsamples, timestamp_10msec):
+        """Process audio samples from the rover.
+        
+        Args:
+            pcmsamples: List of PCM audio samples
+            timestamp_10msec: Timestamp in 10ms units (unused but kept for API compatibility)
+        """
+        if self.pcm_file:
+            try:
+                for samp in pcmsamples:
+                    self.pcm_file.write(f'{samp}\n')
+            except IOError:
+                pass  # Continue if file write fails
 
-        for samp in pcmsamples:
-            self.pcmfile.write('%d\n' % samp)
-
-    # Automagically called by Rover class
     def processVideo(self, jpegbytes, timestamp_10msec):
-
+        """Process video frames from the rover and handle controller input.
+        
+        Args:
+            jpegbytes: JPEG image data from rover
+            timestamp_10msec: Timestamp in 10ms units (unused but kept for API compatibility)
+        """
         # Update controller events
-        pygame.event.pump()    
-
-        # Toggle lights    
-        self.lightsAreOn  = self.checkButton(self.lightsAreOn, BUTTON_LIGHTS, self.turnLightsOn, self.turnLightsOff)   
-            
-        # Toggle night vision (infrared camera)    
-        self.stealthIsOn = self.checkButton(self.stealthIsOn, BUTTON_STEALTH, self.turnStealthOn, self.turnStealthOff)   
-        # Move camera up/down    
-        if self.controller.get_button(BUTTON_CAMERA_UP):  
+        pygame.event.pump()
+        
+        # Toggle lights
+        self.lights_are_on = self._check_button(
+            self.lights_are_on, BUTTON_LIGHTS, 
+            self.turnLightsOn, self.turnLightsOff
+        )
+        
+        # Toggle night vision (infrared camera)
+        self.stealth_is_on = self._check_button(
+            self.stealth_is_on, BUTTON_STEALTH, 
+            self.turnStealthOn, self.turnStealthOff
+        )
+        
+        # Move camera up/down
+        if self.controller.get_button(BUTTON_CAMERA_UP):
             self.moveCameraVertical(1)
-        elif self.controller.get_button(BUTTON_CAMERA_DOWN): 
+        elif self.controller.get_button(BUTTON_CAMERA_DOWN):
             self.moveCameraVertical(-1)
         else:
             self.moveCameraVertical(0)
-            
-        # Set treads based on axes        
-        self.setTreads(self.axis(1), self.axis(3))
-
+        
+        # Set treads based on axes
+        self.setTreads(self._get_axis_value(1), self._get_axis_value(3))
+        
         # Display video image if possible
-        try:
-            if cv:
-
-                # Save image to file on disk and load as OpenCV image
-                fname = 'tmp.jpg'
-                fd = open(fname, 'w')
-                fd.write(jpegbytes)
-                fd.close()
-                image = cv.LoadImage(fname)        
-
-                # Show image
-                cv.ShowImage(self.wname, image )
-                if cv.WaitKey(1) & 0xFF == 27: # ESC
-                    self.quit = True
-            else:
-                pass
-        except:
-            pass
+        if self.video_enabled and cv2 is not None:
+            try:
+                # Decode JPEG bytes directly in memory
+                nparr = np.frombuffer(jpegbytes, np.uint8)
+                image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                
+                if image is not None:
+                    # Show image
+                    cv2.imshow(self.wname, image)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == 27:  # ESC key
+                        self.quit = True
+                        
+            except (cv2.error, ValueError) as e:
+                print(f"Video processing error: {e}")
         
         
-    # Converts Y coordinate of specified axis to +/-1 or 0
-    def axis(self, index):
-        
+    def _get_axis_value(self, index: int) -> int:
+        """Convert axis coordinate to normalized direction value."""
         value = -self.controller.get_axis(index)
         
         if value > MIN_AXIS_ABSVAL:
@@ -145,37 +173,76 @@ class PS3Rover(Rover20):
             return 0
 
 
-    # Handles button bounce by waiting a specified time between button presses   
-    def checkButton(self, flag, buttonID, onRoutine=None, offRoutine=None):
-        if self.controller.get_button(buttonID):
-            if (time.time() - self.lastButtonTime) > MIN_BUTTON_LAG_SEC:
-                self.lastButtonTime = time.time()
+    def _check_button(self, flag: bool, button_id: int, 
+                     on_routine=None, off_routine=None) -> bool:
+        """Handle button press with debouncing logic."""
+        if self.controller.get_button(button_id):
+            current_time = time.time()
+            if (current_time - self.last_button_time) > MIN_BUTTON_LAG_SEC:
+                self.last_button_time = current_time
                 if flag:
-                    if offRoutine:
-                        offRoutine()
-                    flag = False
+                    if off_routine:
+                        off_routine()
+                    return False
                 else:
-                    if onRoutine:
-                        onRoutine()
-                    flag = True
+                    if on_routine:
+                        on_routine()
+                    return True
         return flag
+    
+    def cleanup(self):
+        """Clean up resources."""
+        if self.pcm_file:
+            try:
+                self.pcm_file.close()
+            except IOError:
+                pass
         
-# main -----------------------------------------------------------------------------------
+        if self.video_enabled and cv2 is not None:
+            cv2.destroyAllWindows()
+    
+    def __del__(self):
+        """Destructor to ensure cleanup."""
+        self.cleanup()
+        
+def main():
+    """Main function to run the PS3 Rover controller."""
+    rover = None
+    try:
+        # Create a PS3 Rover object
+        rover = PS3Rover()
+        print(f"Connected to controller: {rover.controller.get_name()}")
+        print("Controls:")
+        print("  Left/Right sticks: Move treads")
+        print("  Triangle/X: Camera up/down")
+        print("  Square: Toggle lights")
+        print("  Circle: Toggle infrared")
+        print("  ESC key in video window: Quit")
+        print("  Ctrl+C: Emergency stop")
+        
+        # Set up signal handler for CTRL-C
+        signal.signal(signal.SIGINT, _signal_handler)
+        
+        # Main control loop with small sleep to prevent busy waiting
+        while not rover.quit:
+            time.sleep(0.01)  # 100 FPS max, reduces CPU usage
+            
+    except RuntimeError as e:
+        print(f"Error: {e}")
+        return 1
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        return 1
+    finally:
+        # Clean shutdown
+        if rover:
+            rover.cleanup()
+            rover.close()
+        print("Rover connection closed.")
+    return 0
+
 
 if __name__ == '__main__':
-
-    # Create a PS3 Rover object
-    rover = PS3Rover()
-
-    # Set up signal handler for CTRL-C
-    signal.signal(signal.SIGINT, _signal_handler)
-
-    # Loop until user hits quit button on controller
-    while not rover.quit:
-        pass
-
-    # Shut down Rover
-    rover.close()
-
-
-
+    sys.exit(main())
